@@ -3,10 +3,12 @@
 # `continuous` artifacts for ${ARCH} into one pkg(8) package each (named after
 # the source repo), plus a NextBSD-everything meta, into a FLAT repo (out/repo/).
 #
-# Arch-aware: amd64 gets all four packages; arm64 gets base + kernel + userland
-# but NOT kernel-extensions (the kexts are amd64-only builds today). The
-# packaging itself is cross-arch on the x86 VM — pkg create just tars already-built
-# ELF with the ${ABI} label; it doesn't compile.
+# Arch-aware: both arches get all four packages. The kext SETS differ (arm64
+# ships the drm core + virtio-gpu trio; amd64 adds Intel/AMD/Radeon/NVIDIA/
+# Bochs/VBox), so kernel-extensions is built from whatever kext tarballs the
+# workflow fetched for this arch — and skipped entirely if there are none. The
+# packaging itself is cross-arch on the x86 VM — pkg create just tars
+# already-built ELF with the ${ABI} label; it doesn't compile.
 #
 # Coherent-snapshot versioning (all share one version this run); UNSIGNED for now.
 set -eux
@@ -67,11 +69,18 @@ cp "/tmp/kx/$KPATH" stage/kernel/boot/kernel/kernel
 chmod 555 stage/kernel/boot/kernel/kernel
 mkpkg NextBSD-kernel stage/kernel "NextBSD kernel (FreeBSD 15 KBI, Mach + Darwin glue baked in)" ""
 
-# --- 3. NextBSD-kernel-extensions (all kexts; amd64-only today) ---
+# --- 3. NextBSD-kernel-extensions (every kext artifact this arch has) ---
+# Glob rather than a fixed name list: the graphics asset is per-arch
+# (graphics-kexts-${ARCH}.tar.gz, nextbsd-kernel-modules#36) while the
+# amd64-only ones (intelwifi/intelethernet/nvidia) stay arch-less, and the
+# workflow above only ever puts THIS arch's tarballs in art/. A new kext
+# artifact upstream is then packaged with no change here.
 HAVE_KEXTS=0
 mkdir -p stage/kexts/System/Library/Extensions
-for k in intelethernet-kext intelwifi-kext graphics-kexts nvidia-kexts; do
-  [ -f "art/${k}.tar.gz" ] && tar -C stage/kexts/System/Library/Extensions -xzf "art/${k}.tar.gz"
+for t in art/*kext*.tar.gz; do
+  [ -f "$t" ] || continue
+  echo "unpacking kext artifact: $t"
+  tar -C stage/kexts/System/Library/Extensions -xzf "$t"
 done
 if ls stage/kexts/System/Library/Extensions/*.kext >/dev/null 2>&1; then
   # Tarballs carry their build-runner uid; OSKext requires root:wheel + go-w.
@@ -88,7 +97,13 @@ if ls stage/kexts/System/Library/Extensions/*.kext >/dev/null 2>&1; then
     [ -f "$act" ] && sh "$act" "/System/Library/Extensions/$(basename "$b")" stage/kexts
   done
   echo "=== staged kexts + userland ==="; ls -1 stage/kexts/System/Library/Extensions
-  mkpkg NextBSD-kernel-extensions stage/kexts "NextBSD kernel extensions (IntelEthernet, IntelWiFi, drm graphics + NVIDIAGraphics kexts/firmware + NVIDIA userland bundle)" "$(dep NextBSD-kernel)"
+  # Comment is arch-accurate: arm64 carries neither the Intel NIC/WiFi kexts nor
+  # NVIDIA, so naming them unconditionally would advertise parts that aren't there.
+  case "$ARCH" in
+    amd64) KXCOMMENT="NextBSD kernel extensions (IntelEthernet, IntelWiFi, drm graphics + virtio-gpu + NVIDIAGraphics kexts/firmware + NVIDIA userland bundle)" ;;
+    *)     KXCOMMENT="NextBSD kernel extensions (drm graphics core + virtio-gpu kexts)" ;;
+  esac
+  mkpkg NextBSD-kernel-extensions stage/kexts "$KXCOMMENT" "$(dep NextBSD-kernel)"
   # Guard: NextBSD-kernel-extensions MUST stay mesa/llvm-free. The NVIDIA bundle
   # vendors libgbm.so.1 (nvidia-mkbundle.sh) so pkg records it as shlibs_provided
   # and adds NO mesa-libs dependency. If a change ever drops that in-package
