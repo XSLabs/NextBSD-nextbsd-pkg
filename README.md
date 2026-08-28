@@ -43,7 +43,7 @@ Then install the whole OS via the meta-package (and upgrade as CI republishes):
 
 ```sh
 pkg update
-pkg install NextBSD-everything      # base + kernel + userland (+ kernel-extensions on amd64)
+pkg install NextBSD-everything      # base + kernel + userland + kernel-extensions
 pkg upgrade                    # rolling: picks up each new snapshot
 ```
 
@@ -53,7 +53,7 @@ pkg upgrade                    # rolling: picks up each new snapshot
 |---|:--:|:--:|---|
 | `NextBSD-freebsd-compat` | ✓ | ✓ | nextbsd-freebsd-compat (base: libc, PAM, commands) |
 | `NextBSD-kernel` | ✓ | ✓ | nextbsd-kernel (kernel binary) |
-| `NextBSD-kernel-extensions` | ✓ | — | nextbsd-kernel-modules (kexts; amd64-only today) |
+| `NextBSD-kernel-extensions` | ✓ | ✓ | nextbsd-kernel-modules (kexts; 17 on amd64, the 7-kext virtio-gpu stack on arm64) |
 | `NextBSD-userland` | ✓ | ✓ | nextbsd-userland (Darwin Mach runtime + daemons) |
 | `NextBSD-everything` (meta) | ✓ | ✓ | depends on all of the above |
 
