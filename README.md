@@ -7,16 +7,16 @@ GitHub Release tags (`continuous-amd64` / `continuous-arm64`).
 ## How it works
 
 ```
-nextbsd-freebsd-compat ─┐
-nextbsd-kernel ─────────┤  continuous artifacts
-nextbsd-kernel-modules ─┤  (raw .tar.gz, per arch)
-nextbsd-userland ───────┘
-            │  repository_dispatch: userland-updated  (the single auto trigger)
-            ▼
-        nextbsd-pkg  ──(pkg create / pkg repo, inside a FreeBSD VM)──▶  flat repo
-            │
-            ▼  GitHub Release assets:  continuous-amd64 / continuous-arm64
-        users:  pkg update && pkg upgrade        ISO builder:  pkg install NextBSD-everything
+nextbsd-freebsd-compat ────┐
+nextbsd-kernel ────────────┤  continuous artifacts
+nextbsd-kernel-extensions ─┤  (raw .tar.gz, per arch)
+nextbsd-userland ──────────┘
+               │  repository_dispatch: userland-updated  (the single auto trigger)
+               ▼
+           nextbsd-pkg  ──(pkg create / pkg repo, inside a FreeBSD VM)──▶  flat repo
+               │
+               ▼  GitHub Release assets:  continuous-amd64 / continuous-arm64
+           users:  pkg update && pkg upgrade     ISO builder:  pkg install NextBSD-everything
 ```
 
 - **pkg runs in a FreeBSD VM** (vmactions) — the Linux runner only downloads the
@@ -53,7 +53,7 @@ pkg upgrade                    # rolling: picks up each new snapshot
 |---|:--:|:--:|---|
 | `NextBSD-freebsd-compat` | ✓ | ✓ | nextbsd-freebsd-compat (base: libc, PAM, commands) |
 | `NextBSD-kernel` | ✓ | ✓ | nextbsd-kernel (kernel binary) |
-| `NextBSD-kernel-extensions` | ✓ | ✓ | nextbsd-kernel-modules (kexts; 17 on amd64, the 7-kext virtio-gpu stack on arm64) |
+| `NextBSD-kernel-extensions` | ✓ | ✓ | nextbsd-kernel-extensions (kexts; 17 on amd64, the 7-kext virtio-gpu stack on arm64) |
 | `NextBSD-userland` | ✓ | ✓ | nextbsd-userland (Darwin Mach runtime + daemons) |
 | `NextBSD-everything` (meta) | ✓ | ✓ | depends on all of the above |
 

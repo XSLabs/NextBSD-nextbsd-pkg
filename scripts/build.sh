@@ -71,7 +71,7 @@ mkpkg NextBSD-kernel stage/kernel "NextBSD kernel (FreeBSD 15 KBI, Mach + Darwin
 
 # --- 3. NextBSD-kernel-extensions (every kext artifact this arch has) ---
 # Glob rather than a fixed name list: the graphics asset is per-arch
-# (graphics-kexts-${ARCH}.tar.gz, nextbsd-kernel-modules#36) while the
+# (graphics-kexts-${ARCH}.tar.gz, nextbsd-kernel-extensions#36) while the
 # amd64-only ones (intelwifi/intelethernet/nvidia) stay arch-less, and the
 # workflow above only ever puts THIS arch's tarballs in art/. A new kext
 # artifact upstream is then packaged with no change here.

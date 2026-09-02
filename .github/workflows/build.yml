@@ -52,13 +52,13 @@ jobs:
           # Graphics kexts are per-arch: BOTH arches ship a stack (amd64 the
           # drm core + Intel/AMD/Radeon/Bochs/VBox, arm64 the drm core + the
           # virtio-gpu trio), under the same bundle names — hence the -${ARCH}
-          # suffix (nextbsd-kernel-modules#36).
-          gh release download continuous -R nextbsd-redux/nextbsd-kernel-modules \
+          # suffix (nextbsd-kernel-extensions#36).
+          gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
             --pattern "graphics-kexts-${ARCH}.tar.gz" --dir art --clobber || true
           if [ "$ARCH" = amd64 ]; then
             # IntelWiFi / IntelEthernet / NVIDIA are genuinely amd64-only builds
             # and keep their arch-less asset names.
-            gh release download continuous -R nextbsd-redux/nextbsd-kernel-modules \
+            gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
               --pattern 'intelwifi-kext.tar.gz' \
               --pattern 'intelethernet-kext.tar.gz' \
               --pattern 'nvidia-kexts.tar.gz' --dir art --clobber || true
@@ -66,7 +66,7 @@ jobs:
             # cannot regress amd64 by merging ahead of kernel-modules#36. Drop
             # this once that asset is pruned from the continuous release.
             [ -f art/graphics-kexts-amd64.tar.gz ] || \
-              gh release download continuous -R nextbsd-redux/nextbsd-kernel-modules \
+              gh release download continuous -R nextbsd/nextbsd-kernel-extensions \
                 --pattern 'graphics-kexts.tar.gz' --dir art --clobber || true
           fi
           ls -lh art/
