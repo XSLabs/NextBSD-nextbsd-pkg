@@ -19,7 +19,9 @@ name: Build NextBSD packages
 # pull_request builds the packages but never publishes, so the packaging itself
 # is still exercised on every change here.
 #
-# Both arches ship base + kernel + userland + contrib + kernel-extensions. The kext sets
+# Both arches ship base + kernel + userland + contrib + kernel-extensions, plus the
+# display server stack (displayserver-support, xlibs, mesa, xlibre) and the E24
+# packages (gnustep-, printing-support, toolchain). The kext sets
 # differ (arm64 has no Intel/AMD/Radeon/NVIDIA/Bochs/VBox parts, and ships the
 # drm core + the virtio-gpu trio instead), so the graphics asset is per-arch;
 # build.sh still skips the package entirely when an arch has no kexts at all.
@@ -55,10 +57,32 @@ jobs:
             --pattern "nextbsd-kernel-${ARCH}.tar.gz" --dir art --clobber
           gh release download continuous -R nextbsd/nextbsd-userland \
             --pattern "nextbsd-userland-${ARCH}.tar.gz" --dir art --clobber
-          # Third-party base programs (sudo, zsh, pico), built against the
-          # compat base only and published by nextbsd-contrib.
+          # The rest are one artifact per repo, nextbsd-<repo>-<arch>.tar.gz,
+          # each packaged as NextBSD-<repo> by build.sh's repkg. Adding a repo
+          # is one word here and one repkg call there.
+          #   contrib: third-party base programs (sudo, zsh, pico).
+          #   displayserver-support, xlibs, mesa, xlibre: the display server
+          #     stack (E23 nextbsd#561, E25 nextbsd#583).
+          #   gnustep-support, printing-support, toolchain: E24 (nextbsd#574),
+          #     what GNUstep needs plus the on-machine toolchain. Gershwin
+          #     builds GNUstep itself (D10). nextbsd-gershwin-support is
+          #     deliberately not packaged (maintainer, 2026-10-25).
+          # None of the display or E24 packages is in NextBSD-everything.
+          for r in contrib \
+                   displayserver-support xlibs mesa xlibre \
+                   gnustep-support printing-support toolchain; do
+            gh release download continuous -R "nextbsd/nextbsd-$r" \
+              --pattern "nextbsd-$r-${ARCH}.tar.gz" --dir art --clobber
+          done
+          # NextBSD's own pkg (pkg#19), built by nextbsd-contrib in its own
+          # artifact: packaged as `pkg` for this arch, and the amd64 build's
+          # pkg-static (in art/tool/) is what build.sh runs on the amd64 VM
+          # for pkg create and pkg repo, whichever arch is being packaged.
           gh release download continuous -R nextbsd/nextbsd-contrib \
-            --pattern "nextbsd-contrib-${ARCH}.tar.gz" --dir art --clobber
+            --pattern "nextbsd-contrib-pkg-${ARCH}.tar.gz" --dir art --clobber
+          mkdir -p art/tool
+          gh release download continuous -R nextbsd/nextbsd-contrib \
+            --pattern "nextbsd-contrib-pkg-amd64.tar.gz" --dir art/tool --clobber
           # Graphics kexts are per-arch: BOTH arches ship a stack (amd64 the
           # drm core + Intel/AMD/Radeon/Bochs/VBox, arm64 the drm core + the
           # virtio-gpu trio), under the same bundle names — hence the -${ARCH}
@@ -103,6 +127,11 @@ jobs:
             # shipping (nextbsd#370). Both run on PRs too (publish does not).
             ARCH=${{ matrix.arch }} sh scripts/build.sh
             ARCH=${{ matrix.arch }} sh scripts/install-test.sh
+            # copyback rsyncs the whole work dir back to the runner, and only
+            # out/repo is needed (publish). The staged trees and artifacts are
+            # ~2.5 GB with the display and E24 packages, and that transfer has
+            # been dropping mid-way; leave only out/repo to copy back.
+            rm -rf stage tool art
 
       - name: Publish flat repo to continuous-${{ matrix.arch }}
         if: github.event_name != 'pull_request'

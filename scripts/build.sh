@@ -3,7 +3,7 @@
 # `continuous` artifacts for ${ARCH} into one pkg(8) package each (named after
 # the source repo), plus a NextBSD-everything meta, into a FLAT repo (out/repo/).
 #
-# Arch-aware: both arches get all five packages. The kext SETS differ (arm64
+# Arch-aware: both arches get every package. The kext SETS differ (arm64
 # ships the drm core + virtio-gpu trio; amd64 adds Intel/AMD/Radeon/NVIDIA/
 # Bochs/VBox), so kernel-extensions is built from whatever kext tarballs the
 # workflow fetched for this arch — and skipped entirely if there are none. The
@@ -13,7 +13,7 @@
 # Coherent-snapshot versioning (all share one version this run); UNSIGNED for now.
 set -eux
 
-pkg --version || pkg bootstrap -y
+pkg --version || pkg bootstrap -y   # the VM's own pkg; install-test.sh uses it
 
 ARCH="${ARCH:-amd64}"
 # pkg's ABI uses 'aarch64' for 64-bit ARM, while the artifact files are named 'arm64'.
@@ -21,16 +21,52 @@ case "$ARCH" in arm64) ABIARCH=aarch64 ;; *) ABIARCH="$ARCH" ;; esac
 ABI="FreeBSD:15:${ABIARCH}"
 VER="0.0.0.$(date -u +%Y%m%d%H%M%S)"
 
-rm -rf stage out
+rm -rf stage out tool
 mkdir -p out/repo
 
-# mkpkg <name> <stagedir> <comment> <deps-ucl-or-empty>
+# --- NextBSD's own pkg builds the repo (pkg#19) ---
+# `pkg create`, `pkg query` and `pkg repo` below run NextBSD's pkg-static (from
+# nextbsd-contrib, the same build the `pkg` package ships), not the VM's
+# FreeBSD pkg. The VM is amd64 whatever ${ARCH} is, so the workflow always
+# fetches the amd64 artifact as art/tool/; pkg-static is fully static and
+# built for FreeBSD 15.1, so it runs on this 15.1 VM. NextBSD's pkg reads
+# /private/etc/pkg.conf and /private/etc/pkg/, which the VM doesn't have, so
+# it gets an explicit empty config (-C) and repo directory (-R) instead and
+# never falls back to a default path.
+mkdir -p tool/root tool/repos
+tar -C tool/root -xzf art/tool/nextbsd-contrib-pkg-amd64.tar.gz ./usr/sbin/pkg-static
+: > tool/pkg.conf
+NBPKG="$PWD/tool/root/usr/sbin/pkg-static -C $PWD/tool/pkg.conf -R $PWD/tool/repos"
+$NBPKG --version
+
+# Every NextBSD-* package carries these two manifest entries:
+#   vital: true -- pkg refuses to delete it (pkg delete without -f, autoremove,
+#     and removal to resolve a conflict with another repo's package); upgrades
+#     still replace it. To retire a package, publish one last version without
+#     vital (README "Vital packages").
+#   annotation org.nextbsd.origin: NextBSD -- NextBSD's pkg (nextbsd-contrib)
+#     lets a local package file without it install only under /usr/local and
+#     /var, and only a stamped pkg may replace pkg.
+NBMARK='vital: true
+annotations: { "org.nextbsd.origin": "NextBSD" }'
+
+# mkpkg <name> <stagedir> <comment> <deps-ucl-or-empty> [<dir>...]
+#   Every file and symlink in <stagedir> goes in the plist. Directories are
+#   not listed (most come from the base mtree), so a package that must create
+#   an EMPTY directory names it after the deps, and it is recorded as @dir.
+#   pkg create records each ELF library's SONAME as shlibs_provided (pkg's
+#   SHLIB_PROVIDE_PATHS_* are unset, so no path is filtered out) and each
+#   NEEDED entry as shlibs_required. It skips ELF files whose arch differs
+#   from its own ABI, so it runs with the TARGET ABI pinned (the VM is amd64):
+#   without that, every arm64 package would declare no shlibs at all. As in
+#   install-test.sh, pkg wants OSVERSION whenever ABI is pinned.
 mkpkg() {
   _name=$1; _root=$2; _comment=$3; _deps=$4
+  shift 4
   cat > /tmp/+MANIFEST <<UCL
 name: ${_name}
 origin: nextbsd/${_name}
-version: "${VER}"
+version: "${_mver:-$VER}"
 comment: "${_comment}"
 desc: "${_comment} — NextBSD ${ARCH} ${VER} snapshot."
 maintainer: "dev@nextbsd.org"
@@ -38,15 +74,56 @@ www: "https://nextbsd.org"
 abi: "${ABI}"
 arch: "${ABI}"
 prefix: "/"
+${NBMARK}
 UCL
   [ -n "${_deps}" ] && printf '%s\n' "${_deps}" >> /tmp/+MANIFEST
   ( cd "${_root}" && find . \( -type f -o -type l \) | sed 's#^\.##' ) | sort > /tmp/plist
+  for _dir in "$@"; do
+    [ -d "${_root}${_dir}" ] || { echo "ERROR: ${_name}: directory ${_dir} is not in its artifact" >&2; exit 1; }
+    echo "@dir ${_dir}" >> /tmp/plist
+  done
   echo "=== ${_name}: $(wc -l < /tmp/plist) files ==="
-  pkg create -M /tmp/+MANIFEST -p /tmp/plist -r "${_root}" -o out/repo
+  env ABI="${ABI}" OSVERSION="$(uname -K)" \
+    $NBPKG create -M /tmp/+MANIFEST -p /tmp/plist -r "${_root}" -o out/repo
 }
 
 dep()  { printf 'deps: { %s: { origin: "nextbsd/%s", version: "%s" } }\n' "$1" "$1" "$VER"; }
 dep2() { printf 'deps: { %s: { origin: "nextbsd/%s", version: "%s" }, %s: { origin: "nextbsd/%s", version: "%s" } }\n' "$1" "$1" "$VER" "$2" "$2" "$VER"; }
+# deps <name>... : one deps block for any number of same-snapshot NextBSD-* packages.
+deps() {
+  _sep=
+  printf 'deps: {'
+  for _d in "$@"; do printf '%s %s: { origin: "nextbsd/%s", version: "%s" }' "$_sep" "$_d" "$_d" "$VER"; _sep=,; done
+  printf ' }\n'
+}
+# repkg [-a <artifact>] [-v <version>] <name> <stage> <comment> [<dep>...] [-- <dir>...]
+#   Repackages one component repo's `continuous` artifact as is:
+#   art/nextbsd-<repo>-${ARCH}.tar.gz (NextBSD-<repo> lowercased; -a names
+#   another art/<artifact>-${ARCH}.tar.gz) is unpacked into stage/<stage> and
+#   packaged as <name>, depending on the same-snapshot NextBSD-* packages
+#   listed. The package takes the snapshot version unless -v gives its own.
+#   Directories after `--` are recorded as @dir (see mkpkg). Adding a repo is
+#   one call here plus one download in the workflow.
+repkg() {
+  _rartbase=; _mver=
+  while :; do
+    case "$1" in
+      -a) _rartbase=$2; shift 2 ;;
+      -v) _mver=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  _rname=$1; _rstage=stage/$2; _rcomment=$3; shift 3
+  _rdeps=
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do _rdeps="$_rdeps $1"; shift; done
+  [ "${1:-}" = -- ] && shift
+  _rart="art/${_rartbase:-$(echo "$_rname" | tr '[:upper:]' '[:lower:]')}-${ARCH}.tar.gz"
+  mkdir -p "$_rstage"
+  tar -C "$_rstage" -xzf "$_rart"
+  # shellcheck disable=SC2086 # word-splitting the dep list is intended
+  mkpkg "$_rname" "$_rstage" "$_rcomment" "$([ -n "$_rdeps" ] && deps $_rdeps)" "$@"
+  _mver=
+}
 
 # --- 1. NextBSD-freebsd-compat (FreeBSD base: libc/libs, PAM, commands) ---
 mkdir -p stage/compat
@@ -103,7 +180,15 @@ if ls stage/kexts/System/Library/Extensions/*.kext >/dev/null 2>&1; then
     amd64) KXCOMMENT="NextBSD kernel extensions (IntelEthernet, IntelWiFi, drm graphics + virtio-gpu + NVIDIAGraphics kexts/firmware + NVIDIA userland bundle)" ;;
     *)     KXCOMMENT="NextBSD kernel extensions (drm graphics core + virtio-gpu kexts)" ;;
   esac
-  mkpkg NextBSD-kernel-extensions stage/kexts "$KXCOMMENT" "$(dep NextBSD-kernel)"
+  # The NVIDIA userland bundle's GLX and GBM libraries link libX11, libXext
+  # and libdrm. Those come from NextBSD-xlibs and -displayserver-support, and
+  # pkg would pull both in through shlibs_required, putting X into
+  # NextBSD-everything (still open, nextbsd#571). The bundle's X half is only
+  # used once X is installed, and installing NextBSD-xlibre brings these
+  # libraries, so the package doesn't require them.
+  KXIGNORE='shlibs_required_ignore: [ "libX11.so.6", "libXext.so.6", "libdrm.so.2" ]'
+  mkpkg NextBSD-kernel-extensions stage/kexts "$KXCOMMENT" "$(dep NextBSD-kernel)
+${KXIGNORE}"
   # Guard: NextBSD-kernel-extensions MUST stay mesa/llvm-free. The NVIDIA bundle
   # vendors libgbm.so.1 (nvidia-mkbundle.sh) so pkg records it as shlibs_provided
   # and adds NO mesa-libs dependency. If a change ever drops that in-package
@@ -113,7 +198,7 @@ if ls stage/kexts/System/Library/Extensions/*.kext >/dev/null 2>&1; then
   # Fail the build loudly instead of shipping that.
   kxpkg=$(ls out/repo/NextBSD-kernel-extensions-*.pkg 2>/dev/null | head -1)
   if [ -n "$kxpkg" ]; then
-    baddep=$(pkg query -F "$kxpkg" '%dn' 2>/dev/null | grep -iE 'mesa|llvm|gallium' || true)
+    baddep=$($NBPKG query -F "$kxpkg" '%dn' 2>/dev/null | grep -iE 'mesa|llvm|gallium' || true)
     [ -z "$baddep" ] || { echo "ERROR: NextBSD-kernel-extensions gained a forbidden dependency: $baddep" >&2; echo "  libgbm.so.1 must remain shlibs_provided by the bundle (nvidia-mkbundle.sh)." >&2; exit 1; }
     echo "=== guard OK: NextBSD-kernel-extensions has no mesa/llvm dependency ==="
   fi
@@ -132,39 +217,157 @@ mkpkg NextBSD-userland stage/userland "NextBSD Darwin/Mach userland (Mach, launc
 # NextBSD-freebsd-compat alone. Repackaged verbatim: the tarball carries the
 # modes the build staged, including setuid on /usr/bin/sudo (tar as root keeps
 # it, and pkg create records it).
-mkdir -p stage/contrib
-tar -C stage/contrib -xzf "art/nextbsd-contrib-${ARCH}.tar.gz"
-mkpkg NextBSD-contrib stage/contrib "NextBSD third-party base programs (sudo, zsh, pico)" "$(dep NextBSD-freebsd-compat)"
+repkg NextBSD-contrib contrib "NextBSD third-party base programs (sudo, zsh, pico)" NextBSD-freebsd-compat
 
-# --- 6. NextBSD-everything (meta: installs the whole OS for this arch) ---
+# --- 6-9. Display server stack (E23 nextbsd#561, E25 nextbsd#583) ---
+# One package per repo (E23 D13), each repackaged as is. Dependencies are the
+# artifacts' ELF NEEDED entries matched to the files the other artifacts ship.
+# None of these is in NextBSD-everything: that is still open (nextbsd#571,
+# E23 step 16), so images add them by name.
+#
+# /etc belongs to nextbsd-overlays (pkg#25): /etc/fonts, /etc/xkb,
+# /etc/libinput and the ld-elf.so.conf / PATH entries for /usr/X11 come from
+# there, not from these packages. None of them ships /usr/local or an ldconfig
+# drop-in, and nothing runs ldconfig after install: rtld's default path already
+# covers /usr/lib and /usr/X11/lib.
+#
+# Base provides the X stack (E23 D14, pkg#26): pkg create records every
+# library's SONAME below as shlibs_provided (libdrm.so.2, libX11.so.6,
+# libxcb.so.1, libGL.so.1, libEGL.so.1, libgbm.so.1, ...), so pkg treats a
+# FreeBSD package's shlibs_required on them as satisfied once these are
+# installed. pkg resolves a package's `deps` by package NAME, though, and no
+# declaration in these packages can satisfy a FreeBSD package's dependency on
+# `libX11` or `mesa-libs`; README "Base provides the X stack" has the detail.
+#
+# Upgrades: pkg owns each package's file list, and `pkg upgrade` deletes the
+# files the new version no longer lists (pkg_add_cleanup_old), so a library
+# that moves between NextBSD packages is removed from its old place in the
+# same upgrade.
+
+# 6. NextBSD-displayserver-support: what XLibre and a GNUstep WindowServer
+#    share, in /usr (E25 D4): libdrm, pixman, expat, freetype, fontconfig,
+#    libxkbcommon, xkeyboard-config, epoll-shim, the IOKit libudev, libevdev,
+#    mtdev, libinput and the linux-input shim, plus the org.nextbsd.fc-cache
+#    LaunchDaemon. libudev links libIOKit, CoreFoundation and libdispatch from
+#    the userland.
+repkg NextBSD-displayserver-support displayserver "NextBSD display server support (libdrm, pixman, freetype, fontconfig, libxkbcommon, libinput, IOKit libudev)" \
+  NextBSD-freebsd-compat NextBSD-userland
+
+# 7. NextBSD-xlibs: the X client libraries in /usr/X11, plus libxkbcommon-x11
+#    (E25 D5). libXft and libXfont2 link freetype and fontconfig, and
+#    libxkbcommon-x11 links libxkbcommon, from displayserver-support.
+repkg NextBSD-xlibs xlibs "NextBSD X client libraries in /usr/X11 (libX11, libxcb, libXext, libXft, libxkbcommon-x11, ...)" \
+  NextBSD-freebsd-compat NextBSD-displayserver-support
+
+# 8. NextBSD-mesa: libglvnd, Mesa (LLVM linked statically, no libLLVM) and
+#    GLU in /usr/X11. Links libdrm and expat from displayserver-support.
+repkg NextBSD-mesa mesa "NextBSD OpenGL stack in /usr/X11 (libglvnd, Mesa, GLU)" \
+  NextBSD-freebsd-compat NextBSD-displayserver-support NextBSD-xlibs
+
+# 9. NextBSD-xlibre: the XLibre 25.1.9 server, drivers (vesa and vmmouse on
+#    amd64 only), tools, libepoxy, libxcvt and libpciaccess in /usr/X11; the
+#    org.nextbsd.xlibre LaunchAgent (on-demand X, disabled by default); and
+#    the empty /var/db/xkb for compiled keymaps. The input stack and xkb data
+#    come from displayserver-support.
+repkg NextBSD-xlibre xlibre "NextBSD X server (XLibre 25.1.9, drivers and tools in /usr/X11)" \
+  NextBSD-freebsd-compat NextBSD-displayserver-support NextBSD-xlibs NextBSD-mesa \
+  -- /var/db/xkb
+
+# Log what each display package tells pkg it provides (pkg#26).
+for p in NextBSD-displayserver-support NextBSD-xlibs NextBSD-mesa NextBSD-xlibre; do
+  echo "=== $p shlibs_provided ==="
+  $NBPKG query -F out/repo/"$p"-*.pkg '%b' | sort | tr '\n' ' '; echo
+done
+
+# --- 10-12. E24 (nextbsd#574): GNUstep/Gershwin requirements + the toolchain ---
+# Gershwin builds and installs GNUstep itself into /System (D10); NextBSD ships
+# only what it needs, in /usr and /usr/X11. None of these three is in
+# NextBSD-everything: Gershwin images list them in Gershwin's nextbsd.txt, and
+# NextBSD-toolchain in particular is installed by default on Gershwin images
+# only (D11). Repackaged verbatim: the artifacts carry no /etc (CUPS's config,
+# PAM stack and accounts come from nextbsd-overlays), no /usr/local and no
+# ldconfig drop-in, and nothing runs ldconfig after install (rtld's default
+# path covers /usr/X11/lib; see pkg#25).
+#
+# nextbsd-gershwin-support is deliberately NOT packaged (maintainer,
+# 2026-10-25), so nothing here may depend on it.
+
+# 10. NextBSD-gnustep-support: image formats, GnuTLS (+ nettle, gmp), cairo
+#     (in /usr/X11), libsndfile + libao, SQLite, flite, FFmpeg. cairo links
+#     libX11, libxcb and libXrender from xlibs, and pixman, freetype and
+#     fontconfig from displayserver-support.
+repkg NextBSD-gnustep-support gnustep "NextBSD GNUstep support libraries (image formats, GnuTLS, cairo, sound, SQLite, flite, FFmpeg)" \
+  NextBSD-freebsd-compat NextBSD-displayserver-support NextBSD-xlibs
+
+# 11. NextBSD-printing-support: Apple's CUPS. GnuTLS comes from
+#     gnustep-support; liblaunch (launch_activate_socket) and libdns_sd from
+#     the userland. The compat base drops the BSD LPD suite that CUPS's lp,
+#     lpr, lpq, lprm and lpc replace (nextbsd-freebsd-compat scripts/superseded).
+repkg NextBSD-printing-support printing "NextBSD printing support (Apple's CUPS)" \
+  NextBSD-freebsd-compat NextBSD-userland NextBSD-gnustep-support
+
+# 12. NextBSD-toolchain: on-machine clang/lld 19.1.7, LLVM binutils, gmake,
+#     pkgconf and Apple's Git (client only; libcurl from the userland).
+repkg NextBSD-toolchain toolchain "NextBSD on-machine toolchain (clang/lld 19.1.7, gmake, pkgconf, Git)" \
+  NextBSD-freebsd-compat NextBSD-userland
+
+# --- 13. pkg: NextBSD's own pkg(8) (pkg#19) ---
+# Built by nextbsd-contrib from its frozen pkg 2.8.4 with the NextBSD patches
+# (src/pkg, NEXTBSD.md): pkg comes only from the repository named NextBSD; a
+# package not from it, or a package file without org.nextbsd.origin=NextBSD,
+# may only install under /usr/local and /var. Everything is under /usr. The
+# package ships no configuration: /private/etc/pkg.conf and
+# /private/etc/pkg/NextBSD.conf (which sets the NextBSD repo's priority) come
+# from nextbsd-overlays. Its version is pkg's own (pkg.pc's Version:), not the
+# snapshot, so it compares correctly with other repositories' pkg.
+mkdir -p tool/pc
+tar -C tool/pc -xzf "art/nextbsd-contrib-pkg-${ARCH}.tar.gz" ./usr/libdata/pkgconfig/pkg.pc
+PKGVER=$(sed -n 's/^Version: *//p' tool/pc/usr/libdata/pkgconfig/pkg.pc)
+[ -n "$PKGVER" ] || { echo "ERROR: no Version: in the contrib pkg artifact's pkg.pc" >&2; exit 1; }
+repkg -a nextbsd-contrib-pkg -v "$PKGVER" pkg pkg "NextBSD's pkg(8) package manager (pkg only from the NextBSD repository)" \
+  NextBSD-freebsd-compat
+
+# --- 14. NextBSD-everything (meta: installs the whole OS for this arch) ---
+# The display stack (nextbsd#571 is still open) and the E24 packages (D11;
+# Gershwin's nextbsd.txt) are deliberately not in it.
 mkdir -p stage/everything
 {
   echo "name: NextBSD-everything"
   echo "origin: nextbsd/NextBSD-everything"
   echo "version: \"${VER}\""
-  echo "comment: \"NextBSD-everything meta-package (base + kernel + userland + contrib$([ "$HAVE_KEXTS" = 1 ] && echo ' + kernel-extensions'))\""
+  echo "comment: \"NextBSD-everything meta-package (base + kernel + userland + contrib + pkg$([ "$HAVE_KEXTS" = 1 ] && echo ' + kernel-extensions'))\""
   echo "desc: \"Installs the complete NextBSD ${ARCH} OS snapshot ${VER}.\""
   echo "maintainer: \"dev@nextbsd.org\""
   echo "www: \"https://nextbsd.org\""
   echo "abi: \"${ABI}\""
   echo "arch: \"${ABI}\""
   echo "prefix: \"/\""
+  echo "${NBMARK}"
   echo "deps: {"
   echo "  NextBSD-freebsd-compat: { origin: \"nextbsd/NextBSD-freebsd-compat\", version: \"${VER}\" }"
   echo "  NextBSD-kernel: { origin: \"nextbsd/NextBSD-kernel\", version: \"${VER}\" }"
   echo "  NextBSD-userland: { origin: \"nextbsd/NextBSD-userland\", version: \"${VER}\" }"
   echo "  NextBSD-contrib: { origin: \"nextbsd/NextBSD-contrib\", version: \"${VER}\" }"
+  echo "  pkg: { origin: \"nextbsd/pkg\", version: \"${PKGVER}\" }"
   [ "$HAVE_KEXTS" = 1 ] && echo "  NextBSD-kernel-extensions: { origin: \"nextbsd/NextBSD-kernel-extensions\", version: \"${VER}\" }"
   echo "}"
 } > /tmp/+MANIFEST
 : > /tmp/plist
-pkg create -M /tmp/+MANIFEST -p /tmp/plist -r stage/everything -o out/repo
+env ABI="${ABI}" OSVERSION="$(uname -K)" \
+  $NBPKG create -M /tmp/+MANIFEST -p /tmp/plist -r stage/everything -o out/repo
 
 # --- Layer A (nextbsd#370): fail if any two component packages co-own a path,
 #     BEFORE cataloging/publishing. Fast + deterministic; names the culprit. ---
 sh scripts/check-ownership.sh
 
+# Log each package's vital flag and NextBSD origin stamp (see NBMARK).
+echo "=== vital / org.nextbsd.origin ==="
+for f in out/repo/*.pkg; do
+  $NBPKG query -F "$f" '%n vital=%V' | tr '\n' ' '
+  $NBPKG query -F "$f" '%At=%Av' | grep '^org\.nextbsd\.origin=' || echo "(no org.nextbsd.origin)"
+done
+
 # --- catalog the flat repo ---
 echo "=== packages (${ARCH}) ==="; ls -lh out/repo/*.pkg
-pkg repo out/repo
+$NBPKG repo out/repo
 echo "=== flat repo catalog ==="; ls -lh out/repo
